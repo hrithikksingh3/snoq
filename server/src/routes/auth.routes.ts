@@ -1,0 +1,40 @@
+import crypto from 'node:crypto';
+import { Router } from 'express';
+import multer from 'multer';
+import { z } from 'zod';
+import { OAuth2Client } from 'google-auth-library';
+import { prisma } from '../lib/prisma.js';
+import { hashPassword, signSession, verifyPassword } from '../services/auth.service.js';
+import { env } from '../config/env.js';
+import { requireAuth } from '../middleware/auth.js';
+import { uploadAvatar } from '../services/cloudinary.service.js';
+import { sendPasswordResetEmail } from '../services/mail.service.js';
+import { credentialLimiter, passwordResetLimiter } from '../middleware/rate-limits.js';
+import { validateAvatarUpload } from '../services/upload-validation.service.js';
+
+export const authRouter=Router();
+const credentials=z.object({email:z.string().email().transform(value=>value.toLowerCase()),password:z.string().min(8).max(128),name:z.string().trim().min(1).max(100).optional()});
+const resetSchema=z.object({token:z.string().min(32),password:z.string().min(8).max(128)});
+const avatarUpload=multer({storage:multer.memoryStorage(),limits:{fileSize:2*1024*1024,files:1},fileFilter:(_request,file,done)=>done(null,['image/jpeg','image/png','image/webp'].includes(file.mimetype))});
+const publicUser={id:true,email:true,name:true,avatarUrl:true,phoneNumber:true,createdAt:true,role:true,isSuspended:true} as const;
+const isAdminEmail=(email:string)=>env.ADMIN_EMAIL?.toLowerCase()===email.toLowerCase();
+
+// Google OAuth client IDs are public browser identifiers. Returning this at
+// runtime avoids a fragile duplicate Vite configuration while keeping the
+// client secret exclusively on the server.
+authRouter.get('/google/config', (_req, res) => res.json({ enabled: Boolean(env.GOOGLE_CLIENT_ID), clientId: env.GOOGLE_CLIENT_ID ?? null }));
+
+const sessionCookie={httpOnly:true,secure:env.COOKIE_SECURE,sameSite:env.COOKIE_SECURE?'none' as const:'lax' as const,path:'/'};
+function session(res:import('express').Response,user:{id:string;email:string}) { res.cookie('rv_session',signSession({userId:user.id,email:user.email}),{...sessionCookie,maxAge:7*24*60*60*1000}); }
+function secureToken() { const token=crypto.randomBytes(32).toString('hex'); return {token,tokenHash:crypto.createHash('sha256').update(token).digest('hex')}; }
+
+authRouter.post('/signup',credentialLimiter,async(req,res)=>{const data=credentials.parse(req.body);const exists=await prisma.user.findUnique({where:{email:data.email}});if(exists)return res.status(409).json({message:'An account with that email already exists'});const user=await prisma.user.create({data:{email:data.email,name:data.name,passwordHash:await hashPassword(data.password),role:isAdminEmail(data.email)?'ADMIN':'USER'}});session(res,user);res.status(201).json({user:{id:user.id,email:user.email,name:user.name,avatarUrl:user.avatarUrl,role:user.role}});});
+authRouter.post('/login',credentialLimiter,async(req,res)=>{const data=credentials.pick({email:true,password:true}).parse(req.body);let user=await prisma.user.findUnique({where:{email:data.email}});if(!user?.passwordHash||!(await verifyPassword(data.password,user.passwordHash)))return res.status(401).json({message:'Invalid email or password'});if(user.isSuspended)return res.status(403).json({message:'This account has been suspended. Contact support if you need help.'});if(isAdminEmail(user.email)&&user.role!=='ADMIN')user=await prisma.user.update({where:{id:user.id},data:{role:'ADMIN'}});session(res,user);res.json({user:{id:user.id,email:user.email,name:user.name,avatarUrl:user.avatarUrl,role:user.role}});});
+authRouter.post('/google',credentialLimiter,async(req,res)=>{if(!env.GOOGLE_CLIENT_ID)return res.status(503).json({message:'Google sign-in is not configured'});const {credential}=z.object({credential:z.string().min(1)}).parse(req.body);const ticket=await new OAuth2Client(env.GOOGLE_CLIENT_ID).verifyIdToken({idToken:credential,audience:env.GOOGLE_CLIENT_ID});const profile=ticket.getPayload();if(!profile?.email||!profile.sub)return res.status(401).json({message:'Invalid Google credential'});const email=profile.email.toLowerCase();const conflictingGoogleUser=await prisma.user.findFirst({where:{googleId:profile.sub,NOT:{email}},select:{id:true}});if(conflictingGoogleUser)return res.status(409).json({message:'This Google account is already linked to a different SNOQ account. Sign in with that account or contact support.'});const user=await prisma.user.upsert({where:{email},update:{googleId:profile.sub,name:profile.name??undefined,avatarUrl:profile.picture??undefined,...(isAdminEmail(email)?{role:'ADMIN' as const}:{})},create:{email,googleId:profile.sub,name:profile.name,avatarUrl:profile.picture,role:isAdminEmail(email)?'ADMIN':'USER'}});if(user.isSuspended)return res.status(403).json({message:'This account has been suspended. Contact support if you need help.'});session(res,user);res.json({user:{id:user.id,email:user.email,name:user.name,avatarUrl:user.avatarUrl,role:user.role}});});
+authRouter.post('/logout',(_req,res)=>{res.clearCookie('rv_session',sessionCookie);res.status(204).send();});
+authRouter.get('/me',requireAuth,async(req,res)=>{let user=await prisma.user.findUnique({where:{id:req.auth!.userId},select:publicUser});if(!user)return res.status(401).json({message:'Session invalid'});if(isAdminEmail(user.email)&&user.role!=='ADMIN')user=await prisma.user.update({where:{id:user.id},data:{role:'ADMIN'},select:publicUser});res.json({user});});
+authRouter.patch('/profile',requireAuth,async(req,res)=>{const {name,phoneNumber}=z.object({name:z.string().trim().min(1).max(100),phoneNumber:z.string().trim().min(7).max(20).nullable().optional()}).parse(req.body);const user=await prisma.user.update({where:{id:req.auth!.userId},data:{name,phoneNumber},select:publicUser});res.json({user});});
+authRouter.post('/avatar',requireAuth,avatarUpload.single('avatar'),async(req,res)=>{const file=req.file;if(!file)return res.status(400).json({message:'Choose a JPEG, PNG, or WebP image under 2 MB'});validateAvatarUpload(file);const uploaded=await uploadAvatar(file.buffer);const user=await prisma.user.update({where:{id:req.auth!.userId},data:{avatarUrl:uploaded.secureUrl,avatarPublicId:uploaded.publicId},select:publicUser});res.json({user});});
+authRouter.post('/change-password',requireAuth,async(req,res)=>{const data=z.object({currentPassword:z.string().min(8).max(128),newPassword:z.string().min(8).max(128)}).parse(req.body);const user=await prisma.user.findUnique({where:{id:req.auth!.userId}});if(!user?.passwordHash)return res.status(400).json({message:'This account uses Google sign-in and does not have a local password'});if(!(await verifyPassword(data.currentPassword,user.passwordHash)))return res.status(400).json({message:'Your current password is incorrect'});await prisma.user.update({where:{id:user.id},data:{passwordHash:await hashPassword(data.newPassword),passwordChangedAt:new Date()}});res.status(204).send();});
+authRouter.post('/forgot-password',passwordResetLimiter,async(req,res)=>{const {email}=z.object({email:z.string().email().transform(value=>value.toLowerCase())}).parse(req.body);const user=await prisma.user.findUnique({where:{email}});if(user?.passwordHash){const {token,tokenHash}=secureToken();await prisma.$transaction([prisma.passwordResetToken.deleteMany({where:{userId:user.id}}),prisma.passwordResetToken.create({data:{userId:user.id,tokenHash,expiresAt:new Date(Date.now()+30*60*1000)}})]);await sendPasswordResetEmail(user.email,token);}res.status(204).send();});
+authRouter.post('/reset-password',passwordResetLimiter,async(req,res)=>{const {token,password}=resetSchema.parse(req.body);const tokenHash=crypto.createHash('sha256').update(token).digest('hex');const reset=await prisma.passwordResetToken.findFirst({where:{tokenHash,expiresAt:{gt:new Date()}}});if(!reset)return res.status(400).json({message:'This reset link is invalid or has expired'});await prisma.$transaction([prisma.user.update({where:{id:reset.userId},data:{passwordHash:await hashPassword(password),passwordChangedAt:new Date()}}),prisma.passwordResetToken.deleteMany({where:{userId:reset.userId}})]);res.status(204).send();});

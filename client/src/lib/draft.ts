@@ -1,0 +1,1 @@
+import type { Draft } from '../types'; const KEY='resource-vault:add-resource-draft'; export const draftStore={read:()=>{try{return JSON.parse(localStorage.getItem(KEY)??'null') as Draft|null;}catch{return null;}},write:(draft:Draft)=>localStorage.setItem(KEY,JSON.stringify(draft)),clear:()=>localStorage.removeItem(KEY)};

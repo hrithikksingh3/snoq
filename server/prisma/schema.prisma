@@ -1,0 +1,337 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ResourceKind {
+  URL
+  DOCUMENT
+}
+
+enum AnalysisStatus {
+  SUCCESS
+  FAILED
+  MANUAL
+}
+
+enum ListShareMode {
+  PUBLIC
+  RESTRICTED
+}
+
+enum ListAccessRequestStatus {
+  PENDING
+  APPROVED
+  DECLINED
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+  PENDING
+}
+
+enum PaymentStatus {
+  CREATED
+  PAID
+  FAILED
+  REFUNDED
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  passwordHash String?
+  passwordChangedAt DateTime?
+  name         String?
+  googleId     String?    @unique
+  avatarUrl    String?
+  avatarPublicId String?
+  phoneNumber    String?    @unique
+  createdAt    DateTime   @default(now())
+  resources    Resource[]
+  lists        ResourceList[]
+  passwordResetTokens PasswordResetToken[]
+  role         UserRole @default(USER)
+  isSuspended  Boolean  @default(false)
+  subscriptions UserSubscription[]
+  aiUsage       AiUsage[]
+  couponRedemptions CouponRedemption[]
+}
+
+model SubscriptionPlan {
+  id              String   @id @default(cuid())
+  name            String   @unique
+  description     String?
+  priceInr        Int
+  durationDays    Int      @default(30)
+  aiCredits       Int
+  reportExportsEnabled Boolean @default(false)
+  active          Boolean  @default(true)
+  hidden          Boolean  @default(false)
+  razorpayPlanId  String?  @unique
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  subscriptions   UserSubscription[]
+  coupons         Coupon[]
+  couponRedemptions CouponRedemption[]
+}
+
+model UserSubscription {
+  id                   String             @id @default(cuid())
+  userId               String
+  user                 User               @relation(fields:[userId],references:[id],onDelete:Cascade)
+  planId               String
+  plan                 SubscriptionPlan   @relation(fields:[planId],references:[id])
+  status               SubscriptionStatus @default(PENDING)
+  startsAt             DateTime
+  endsAt               DateTime
+  razorpaySubscriptionId String?          @unique
+  razorpayPaymentId    String?            @unique
+  couponId             String?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+  payments             Payment[]
+  usage                AiUsage[]
+  @@index([userId,status,endsAt])
+}
+
+model AiUsage {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields:[userId],references:[id],onDelete:Cascade)
+  subscriptionId String?
+  subscription   UserSubscription? @relation(fields:[subscriptionId],references:[id],onDelete:SetNull)
+  periodStart    DateTime
+  count          Int      @default(0)
+  updatedAt      DateTime @updatedAt
+  @@unique([userId,periodStart])
+}
+
+model Coupon {
+  id             String   @id @default(cuid())
+  code           String   @unique
+  discountPercent Int
+  planId         String?
+  plan           SubscriptionPlan? @relation(fields:[planId],references:[id],onDelete:SetNull)
+  grantDays      Int?
+  maxRedemptions Int?
+  razorpayOfferId String?  @unique
+  active         Boolean  @default(true)
+  validFrom      DateTime @default(now())
+  validUntil     DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  redemptions    CouponRedemption[]
+}
+
+model CouponRedemption {
+  id          String   @id @default(cuid())
+  couponId    String
+  coupon      Coupon   @relation(fields:[couponId],references:[id],onDelete:Cascade)
+  userId      String
+  user        User     @relation(fields:[userId],references:[id],onDelete:Cascade)
+  planId      String
+  plan        SubscriptionPlan @relation(fields:[planId],references:[id])
+  createdAt   DateTime @default(now())
+  @@unique([couponId,userId])
+}
+
+model Payment {
+  id             String   @id @default(cuid())
+  subscriptionId String
+  subscription   UserSubscription @relation(fields:[subscriptionId],references:[id],onDelete:Cascade)
+  amountInr      Int
+  status         PaymentStatus @default(CREATED)
+  razorpayOrderId String? @unique
+  razorpayPaymentId String? @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  provider    String
+  eventId     String
+  eventType   String
+  receivedAt  DateTime @default(now())
+
+  @@unique([provider, eventId])
+  @@index([receivedAt])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Resource {
+  id             String       @id @default(cuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind           ResourceKind
+  title          String
+  description    String?      @db.Text
+  url            String?
+  normalizedUrl  String?
+  resourceType   String       @default("Other")
+  sourcePlatform String?
+  summary        String?      @db.Text
+  author         String?
+  thumbnailUrl   String?
+  faviconUrl     String?
+  contentHash    String?
+  language       String?
+  isAITool       Boolean      @default(false)
+  isFavorite     Boolean      @default(false)
+  archivedAt     DateTime?
+  lastAnalyzedAt DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  categories     ResourceCategory[]
+  tags           ResourceTag[]
+  analysis       AIAnalysis?
+  document       DocumentMetadata?
+  lists          ResourceListItem[]
+
+  @@index([userId, createdAt])
+  @@index([userId, normalizedUrl])
+  @@index([userId, isFavorite])
+  @@index([userId, archivedAt])
+  @@index([userId, resourceType])
+  @@unique([userId, normalizedUrl])
+}
+
+model ResourceList {
+  id          String             @id @default(cuid())
+  userId      String
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  color       String             @default("blue")
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  resources   ResourceListItem[]
+  shares      ListShare[]
+
+  @@unique([userId, name])
+  @@index([userId, createdAt])
+}
+
+model ListShare {
+  id        String        @id @default(cuid())
+  listId    String
+  list      ResourceList  @relation(fields: [listId], references: [id], onDelete: Cascade)
+  mode      ListShareMode
+  slug      String        @unique
+  enabled   Boolean       @default(true)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  requests  ListAccessRequest[]
+
+  @@unique([listId, mode])
+  @@index([listId])
+}
+
+model ListAccessRequest {
+  id              String                  @id @default(cuid())
+  shareId         String
+  share           ListShare               @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  name            String?
+  email           String
+  status          ListAccessRequestStatus @default(PENDING)
+  accessTokenHash String?                 @unique
+  approvedAt      DateTime?
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+
+  @@unique([shareId, email])
+  @@index([shareId, status])
+}
+
+model ResourceListItem {
+  resourceId String
+  listId     String
+  resource   Resource     @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  list       ResourceList @relation(fields: [listId], references: [id], onDelete: Cascade)
+  createdAt  DateTime     @default(now())
+
+  @@id([resourceId, listId])
+  @@index([listId])
+}
+
+model Category {
+  id        String             @id @default(cuid())
+  name      String             @unique
+  resources ResourceCategory[]
+}
+
+model Tag {
+  id        String        @id @default(cuid())
+  name      String        @unique
+  resources ResourceTag[]
+}
+
+model ResourceCategory {
+  resourceId String
+  categoryId String
+  resource   Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([resourceId, categoryId])
+  @@index([categoryId])
+}
+
+model ResourceTag {
+  resourceId String
+  tagId      String
+  resource   Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  tag        Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([resourceId, tagId])
+  @@index([tagId])
+}
+
+model DocumentMetadata {
+  id                 String   @id @default(cuid())
+  resourceId         String   @unique
+  resource           Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  cloudinaryPublicId String
+  secureUrl          String
+  originalFilename   String
+  mimeType           String
+  size               Int
+  uploadedAt         DateTime @default(now())
+}
+
+model AIAnalysis {
+  id               String         @id @default(cuid())
+  resourceId       String         @unique
+  resource         Resource       @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  provider         String?
+  model            String?
+  primaryProvider  String?
+  fallbackProvider String?
+  status           AnalysisStatus
+  sourceType       String
+  schemaVersion    String         @default("1")
+  result           Json?
+  createdAt        DateTime       @default(now())
+}
